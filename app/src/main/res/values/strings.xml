@@ -1,4 +1,7 @@
 <resources>
     <string name="app_name">Auto Reply</string>
     <string name="tile_label">Auto Reply</string>
+    <string name="widget_description">See and switch your Auto Reply mode</string>
+    <string name="widget_toggle_label">Auto Reply toggle</string>
+    <string name="widget_toggle_description">Tap to turn your mode on or off</string>
 </resources>

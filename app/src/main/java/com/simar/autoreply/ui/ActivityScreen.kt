@@ -48,6 +48,28 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.PhoneCallback
+import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.runtime.saveable.rememberSaveable
+import android.Manifest
+import android.database.ContentObserver
+import android.os.Handler
+import android.os.Looper
+import android.provider.ContactsContract
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.material.icons.rounded.Contacts
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.produceState
+import androidx.compose.ui.text.style.TextOverflow
+import com.simar.autoreply.data.ContactNames
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Call
@@ -70,27 +92,16 @@ import com.simar.autoreply.data.AppStore
 import com.simar.autoreply.data.LogEntry
 import java.util.Calendar
 
-private enum class Outcome { SENT, SKIPPED, FAILED }
+private enum class Outcome(val label: String) {
+    SENT("Texted"), RANG("Rang through"), SKIPPED("Not texted"), FAILED("Failed")
+}
 
 private fun LogEntry.outcome() = when {
+    status.startsWith("Rang through") -> Outcome.RANG
     "not texted" in status.lowercase() -> Outcome.SKIPPED
     "SMS sent" in status -> Outcome.SENT
     else -> Outcome.FAILED
 }
-
-/** Choices for "repeat callers", in minutes. 0 = text on every call. */
-private val IntervalSteps = listOf(0, 5, 10, 15, 30, 45, 60, 120, 240, 480, 720, 1440)
-
-private fun intervalLabel(minutes: Int) = when {
-    minutes == 0 -> "Always"
-    minutes < 60 -> "$minutes min"
-    minutes % 60 == 0 -> "${minutes / 60} h"
-    else -> "${minutes / 60} h ${minutes % 60} m"
-}
-
-private fun stepInterval(current: Int, up: Boolean): Int =
-    if (up) IntervalSteps.firstOrNull { it > current } ?: current
-    else IntervalSteps.lastOrNull { it < current } ?: 0
 
 private fun startOfToday() = Calendar.getInstance().apply {
     set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
@@ -103,8 +114,7 @@ private fun dayLabel(time: Long): String = when {
 }
 
 @Composable
-fun ActivityScreen(modifier: Modifier) {
-    val settings by AppStore.settings.collectAsState()
+fun ActivityScreen(modifier: Modifier, resumeTick: Int) {
     val log by AppStore.log.collectAsState()
     val modes by AppStore.modes.collectAsState()
     val modeByName = remember(modes) { modes.associateBy { it.name } }
@@ -113,8 +123,44 @@ fun ActivityScreen(modifier: Modifier) {
     val sentToday = log.count { it.time >= today && it.outcome() == Outcome.SENT }
     val declinedToday = log.count { it.time >= today && it.status.startsWith("Declined") }
     val sentTotal = log.count { it.outcome() == Outcome.SENT }
-    val grouped = remember(log) { log.groupBy { dayLabel(it.time) } }
     var selected by remember { mutableStateOf<LogEntry?>(null) }
+    var query by rememberSaveable { mutableStateOf("") }
+    var outcomeFilter by rememberSaveable { mutableStateOf<Outcome?>(null) }
+    var modeFilter by rememberSaveable { mutableStateOf<String?>(null) }
+
+    // Contact names: re-read on resume, when permission is granted, and whenever contacts change.
+    val context = LocalContext.current
+    var contactsTick by remember { mutableIntStateOf(0) }
+    val canReadContacts = remember(resumeTick, contactsTick) { ContactNames.canRead(context) }
+    val askContacts = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { contactsTick++ }
+    DisposableEffect(canReadContacts) {
+        val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
+            override fun onChange(selfChange: Boolean) {
+                contactsTick++
+            }
+        }
+        if (canReadContacts) {
+            runCatching {
+                context.contentResolver.registerContentObserver(ContactsContract.Contacts.CONTENT_URI, true, observer)
+            }
+        }
+        onDispose { context.contentResolver.unregisterContentObserver(observer) }
+    }
+    val numbers = remember(log) { log.map { it.number } }
+    val names by produceState(emptyMap<String, String>(), numbers, canReadContacts, contactsTick, resumeTick) {
+        value = withContext(Dispatchers.IO) { ContactNames.lookup(context, numbers) }
+    }
+    val filtered = remember(log, names, query, outcomeFilter, modeFilter) {
+        val q = query.trim().lowercase()
+        val qDigits = q.filter { it.isDigit() }
+        log.filter { e ->
+            (outcomeFilter == null || e.outcome() == outcomeFilter) &&
+                (modeFilter == null || e.mode == modeFilter) &&
+                (q.isEmpty() || names[e.number]?.lowercase()?.contains(q) == true ||
+                    (qDigits.isNotEmpty() && qDigits in e.number.filter { it.isDigit() }))
+        }
+    }
+    val grouped = remember(filtered) { filtered.groupBy { dayLabel(it.time) } }
 
     LazyColumn(
         modifier.fillMaxSize(),
@@ -131,25 +177,25 @@ fun ActivityScreen(modifier: Modifier) {
                 StatTile(Icons.Rounded.TrendingUp, Success, sentTotal.toString(), "All time", Modifier.weight(1f))
             }
         }
-        item {
-            Column(
-                Modifier.fillMaxWidth().clip(MaterialTheme.shapes.medium).background(MaterialTheme.colorScheme.surfaceContainer),
-            ) {
-                SettingRow(Icons.Rounded.PhoneDisabled, "Decline the call", "Hang up before texting the caller") {
-                    Switch(settings.declineCalls, { v -> AppStore.updateSettings { it.copy(declineCalls = v) } })
-                }
-                HorizontalDivider(Modifier.padding(start = 64.dp), color = MaterialTheme.colorScheme.outlineVariant)
-                SettingRow(
-                    Icons.Rounded.Repeat, "Repeat callers",
-                    if (settings.cooldownMinutes == 0) "Text them on every call" else "Text the same number once per",
+        if (!canReadContacts && log.isNotEmpty()) {
+            item {
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(MaterialTheme.shapes.medium)
+                        .background(MaterialTheme.colorScheme.primaryContainer)
+                        .padding(start = 16.dp, end = 8.dp, top = 10.dp, bottom = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Stepper(
-                        value = intervalLabel(settings.cooldownMinutes),
-                        onMinus = { AppStore.updateSettings { it.copy(cooldownMinutes = stepInterval(it.cooldownMinutes, up = false)) } },
-                        onPlus = { AppStore.updateSettings { it.copy(cooldownMinutes = stepInterval(it.cooldownMinutes, up = true)) } },
-                        canMinus = settings.cooldownMinutes > 0,
-                        canPlus = settings.cooldownMinutes < IntervalSteps.last(),
+                    Icon(Icons.Rounded.Contacts, null, tint = MaterialTheme.colorScheme.onPrimaryContainer)
+                    Spacer(Modifier.width(12.dp))
+                    Text(
+                        "Show contact names instead of numbers",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                        modifier = Modifier.weight(1f),
                     )
+                    TextButton({ askContacts.launch(Manifest.permission.READ_CONTACTS) }) { Text("Allow") }
                 }
             }
         }
@@ -159,8 +205,51 @@ fun ActivityScreen(modifier: Modifier) {
                 if (log.isNotEmpty()) TextButton({ AppStore.clearLog() }) { Text("Clear") }
             }
         }
+        if (log.isNotEmpty()) {
+            item {
+                OutlinedTextField(
+                    query, { query = it },
+                    placeholder = { Text("Search name or number") },
+                    leadingIcon = { Icon(Icons.Rounded.Search, null) },
+                    trailingIcon = {
+                        if (query.isNotEmpty()) IconButton({ query = "" }) { Icon(Icons.Rounded.Close, "Clear search") }
+                    },
+                    singleLine = true,
+                    shape = CircleShape,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+            item {
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(Outcome.entries) { o ->
+                        FilterChip(
+                            selected = outcomeFilter == o,
+                            onClick = { outcomeFilter = if (outcomeFilter == o) null else o },
+                            label = { Text(o.label) },
+                        )
+                    }
+                    items(modes) { m ->
+                        FilterChip(
+                            selected = modeFilter == m.name,
+                            onClick = { modeFilter = if (modeFilter == m.name) null else m.name },
+                            label = { Text(m.name) },
+                            leadingIcon = { Icon(modeIcon(m.icon), null, Modifier.size(16.dp), tint = modeColor(m.color)) },
+                        )
+                    }
+                }
+            }
+        }
         if (log.isEmpty()) {
             item { EmptyState() }
+        } else if (filtered.isEmpty()) {
+            item {
+                Text(
+                    "No calls match.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(4.dp),
+                )
+            }
         }
         grouped.forEach { (day, entries) ->
             item(key = "day-$day") {
@@ -172,13 +261,13 @@ fun ActivityScreen(modifier: Modifier) {
                 )
             }
             items(entries, key = { "${it.time}-${it.number}" }) { e ->
-                LogRow(e, modeByName[e.mode]) { selected = e }
+                LogRow(e, names[e.number], modeByName[e.mode]) { selected = e }
             }
         }
     }
 
     selected?.let { e ->
-        LogDetails(e, modes.find { it.name == e.mode }) { selected = null }
+        LogDetails(e, names[e.number], modes.find { it.name == e.mode }) { selected = null }
     }
 }
 
@@ -195,59 +284,39 @@ private fun StatTile(icon: ImageVector, tint: Color, value: String, label: Strin
 }
 
 @Composable
-private fun SettingRow(icon: ImageVector, title: String, subtitle: String, trailing: @Composable () -> Unit) {
-    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-        val tint = MaterialTheme.colorScheme.primary
-        Box(
-            Modifier.size(38.dp).clip(RoundedCornerShape(12.dp)).background(tint.copy(alpha = 0.14f)),
-            contentAlignment = Alignment.Center,
-        ) { Icon(icon, null, tint = tint, modifier = Modifier.size(20.dp)) }
-        Spacer(Modifier.width(12.dp))
-        Column(Modifier.weight(1f)) {
-            Text(title, style = MaterialTheme.typography.bodyLarge)
-            Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-        trailing()
-    }
-}
-
-@Composable
-private fun Stepper(value: String, onMinus: () -> Unit, onPlus: () -> Unit, canMinus: Boolean, canPlus: Boolean) {
-    Row(
-        Modifier.clip(CircleShape).background(MaterialTheme.colorScheme.surfaceContainerHigh),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        IconButton(onMinus, enabled = canMinus, modifier = Modifier.size(40.dp)) { Icon(Icons.Rounded.Remove, "Less", Modifier.size(18.dp)) }
-        Text(
-            value,
-            style = MaterialTheme.typography.labelLarge,
-            textAlign = TextAlign.Center,
-            modifier = Modifier.width(64.dp),
-        )
-        IconButton(onPlus, enabled = canPlus, modifier = Modifier.size(40.dp)) { Icon(Icons.Rounded.Add, "More", Modifier.size(18.dp)) }
-    }
-}
-
-@Composable
 private fun LogEntry.icon(): Pair<ImageVector, Color> = when (outcome()) {
     Outcome.SENT -> Icons.Rounded.MarkChatRead to Success
+    Outcome.RANG -> Icons.Rounded.PhoneCallback to MaterialTheme.colorScheme.primary
     Outcome.SKIPPED -> Icons.Rounded.Repeat to MaterialTheme.colorScheme.onSurfaceVariant
     Outcome.FAILED -> Icons.Rounded.ErrorOutline to MaterialTheme.colorScheme.error
 }
 
 private fun LogEntry.headline() = when (outcome()) {
-    Outcome.SENT -> if (status.startsWith("Declined")) "Declined & texted" else "Texted"
-    Outcome.SKIPPED -> "Not texted again"
+    Outcome.SENT -> when {
+        status.startsWith("Declined") -> "Declined & texted"
+        status.startsWith("Missed") -> "Hung up · texted"
+        else -> "Texted"
+    }
+    Outcome.RANG -> when {
+        "VIP" in status -> "Rang through · VIP"
+        "called again" in status -> "Rang through · called twice"
+        else -> "Rang through · unknown number"
+    }
+    Outcome.SKIPPED -> when {
+        status.startsWith("Answered") -> "You answered"
+        "unknown number" in status -> "Declined · unknown number"
+        else -> "Not texted again"
+    }
     Outcome.FAILED -> "Couldn't send"
 }
 
 /** Anything beyond the standard outcome (e.g. "couldn't decline the call") is worth showing. */
-private fun LogEntry.note() = status.substringAfter(" (", "").removeSuffix(")").ifEmpty {
+private fun LogEntry.note() = status.substringAfter(" (", "").removeSuffix(")").takeIf { it != "unknown number" && it != "you picked up" }.orEmpty().ifEmpty {
     if (outcome() == Outcome.FAILED) status else ""
 }
 
 @Composable
-private fun LogRow(e: LogEntry, mode: Mode?, onClick: () -> Unit) {
+private fun LogRow(e: LogEntry, name: String?, mode: Mode?, onClick: () -> Unit) {
     val (icon, tint) = e.icon()
     val headline = e.headline()
     val detail = e.note()
@@ -264,7 +333,7 @@ private fun LogRow(e: LogEntry, mode: Mode?, onClick: () -> Unit) {
         IconBadge(icon, size = 40, tint = tint)
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
-            Text(e.number, style = MaterialTheme.typography.titleSmall)
+            Text(name ?: e.number, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Text(headline, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             if (detail.isNotEmpty()) {
                 Text(detail, style = MaterialTheme.typography.bodySmall, color = Warn)
@@ -302,7 +371,7 @@ private fun EmptyState() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun LogDetails(e: LogEntry, mode: Mode?, onDismiss: () -> Unit) {
+private fun LogDetails(e: LogEntry, name: String?, mode: Mode?, onDismiss: () -> Unit) {
     val context = LocalContext.current
     val (icon, tint) = e.icon()
     val accent = mode?.let { modeColor(it.color) } ?: MaterialTheme.colorScheme.primary
@@ -321,7 +390,10 @@ private fun LogDetails(e: LogEntry, mode: Mode?, onDismiss: () -> Unit) {
                 IconBadge(icon, size = 52, tint = tint)
                 Spacer(Modifier.width(14.dp))
                 Column {
-                    Text(e.number, style = MaterialTheme.typography.headlineSmall)
+                    Text(name ?: e.number, style = MaterialTheme.typography.headlineSmall)
+                    if (name != null) {
+                        Text(e.number, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
                     Text(
                         e.headline() + " · " + DateFormat.format("EEE d MMM yyyy, h:mm a", e.time),
                         style = MaterialTheme.typography.bodySmall,

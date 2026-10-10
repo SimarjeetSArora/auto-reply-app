@@ -1,0 +1,5 @@
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <!-- Mode colour 4 to its deeper shade, like the app's status card (same palette as ui/Theme.kt). -->
+    <corners android:radius="28dp" />
+    <gradient android:angle="315" android:endColor="#FFB35310" android:startColor="#FFF97316" />
+</shape>
